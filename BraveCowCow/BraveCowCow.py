@@ -1,0 +1,1569 @@
+import logging
+import os
+import glob
+import re
+import vtk
+import qt
+
+import slicer
+from slicer.ScriptedLoadableModule import *
+from slicer.util import VTKObservationMixin
+
+
+class BraveCowCow(ScriptedLoadableModule):
+    def __init__(self, parent):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = "BraveCowCow"
+        self.parent.categories = ["Segmentation"]
+        self.parent.dependencies = []
+        self.parent.contributors = ["Houjing Huang, Kaiyuan Yang, Murong Xu (University of Zurich)"]
+        self.parent.helpText = """
+        BraveCowCow implements a fast 2D tri-axial ROI extraction combined with 3D multi-task segmentation and classification for intracranial vessel analysis.<br>
+        This algorithm achieved 2nd place in the RSNA 2024 Intracranial Aneurysm Detection Challenge.<br><br>
+        
+        For more information, see the <a href="https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection/discussion/544807">solution write-up</a> 
+        and the <a href="https://github.com/murong-xu/SlicerBraveCowCow">extension documentation</a>.
+        """
+        self.parent.acknowledgementText = """
+        The core algorithm was developed by Pengcheng Shi, Yan Lu, and Jiawei Chen (Medical Image Insights, Shanghai), 
+        together with Kaiyuan Yang and Houjing Huang (University of Zurich).<br><br>
+        
+        Kaiyuan Yang, Houjing Huang, and Pengcheng Shi are also organizers of the MICCAI 
+        <a href="https://topcow24.grand-challenge.org/">TopCoW</a> and 
+        <a href="https://topbrain2025.grand-challenge.org/">TopBrain</a> challenges, 
+        which benchmark segmentation of the Circle of Willis and whole-brain vessel anatomy.<br><br>
+        
+        This 3D Slicer extension was developed by Murong Xu (University of Zurich).<br><br>
+        
+        If you use this software in your research, please cite:<br>
+        [Citation to be added]  #TODO: 
+        """
+        slicer.app.connect("startupCompleted()",
+                           self.configureDefaultTerminology)
+
+    def configureDefaultTerminology(self):
+        moduleDir = os.path.dirname(self.parent.path)
+        bravecowcowTerminologyFilePath = os.path.join(
+            moduleDir, 'Resources', 'SegmentationCategoryTypeModifier-BRAVECOWCOW.term.json')
+        tlogic = slicer.modules.terminologies.logic()
+        self.terminologyName = tlogic.LoadTerminologyFromFile(
+            bravecowcowTerminologyFilePath)
+
+
+class BraveCowCowWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    def __init__(self, parent=None):
+        """
+        Called when the user opens the module the first time and the widget is initialized.
+        """
+        ScriptedLoadableModuleWidget.__init__(self, parent)
+        VTKObservationMixin.__init__(self)
+        self.logic = None
+        self._parameterNode = None
+        self._updatingGUIFromParameterNode = False
+
+    def setup(self):
+        """
+        Called when the user opens the module the first time and the widget is initialized.
+        """
+        ScriptedLoadableModuleWidget.setup(self)
+
+        # Load widget from .ui file (created by Qt Designer).
+        # Additional widgets can be instantiated manually and added to self.layout.
+        uiWidget = slicer.util.loadUI(self.resourcePath('UI/BraveCowCow.ui'))
+        self.layout.addWidget(uiWidget)
+        self.ui = slicer.util.childWidgetVariables(uiWidget)
+
+        # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
+        # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
+        # "setMRMLScene(vtkMRMLScene*)" slot.
+        uiWidget.setMRMLScene(slicer.mrmlScene)
+
+        # Create logic class. Logic implements all computations that should be possible to run
+        # in batch mode, without a graphical user interface.
+        self.logic = BraveCowCowLogic()
+        self.logic.logCallback = self.addLog
+
+        self.initializeParameterNode()
+        self.addObserver(
+            slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
+        self.addObserver(slicer.mrmlScene,
+                         slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+
+        # Create button groups for radio buttons
+        self.onlyForwardClsGroup = qt.QButtonGroup()
+        self.onlyForwardClsGroup.addButton(self.ui.onlyForwardClsYesRadio)
+        self.onlyForwardClsGroup.addButton(self.ui.onlyForwardClsNoRadio)
+
+        self.toMerge2SegTaskGroup = qt.QButtonGroup()
+        self.toMerge2SegTaskGroup.addButton(self.ui.toMerge2SegTaskYesRadio)
+        self.toMerge2SegTaskGroup.addButton(self.ui.toMerge2SegTaskNoRadio)
+
+        # Connect TTA type change to update batch size options
+        self.ui.ttaTypeComboBox.currentIndexChanged.connect(self.onTtaTypeChanged)
+        self.ui.ttaBatchSizeComboBox.currentIndexChanged.connect(self.updateParameterNodeFromGUI)
+
+        # Connect radio buttons
+        self.onlyForwardClsGroup.buttonClicked.connect(self.updateParameterNodeFromGUI)
+        self.toMerge2SegTaskGroup.buttonClicked.connect(self.updateParameterNodeFromGUI)
+
+        # Connect all buttons and controls to appropriate slots
+        self.ui.inputVolumeSelector.connect(
+            "currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
+        self.ui.outputSegmentationSelector.connect(
+            "currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
+        self.ui.useStandardSegmentNamesCheckBox.connect(
+            "toggled(bool)", self.updateParameterNodeFromGUI)
+        self.ui.cpuCheckBox.connect(
+            "toggled(bool)", self.updateParameterNodeFromGUI)
+        self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+        self.ui.packageUpgradeButton.connect(
+            'clicked(bool)', self.onPackageUpgrade)
+        self.ui.packageInfoUpdateButton.connect(
+            'clicked(bool)', self.onPackageInfoUpdate)
+
+        # Initial GUI update
+        self.updateGUIFromParameterNode()
+        self.onTtaTypeChanged()
+
+    def cleanup(self):
+        """
+        Called when the application closes and the module widget is destroyed.
+        """
+        self.removeObservers()
+
+    def enter(self):
+        """
+        Called each time the user opens this module.
+        """
+        # Make sure parameter node exists and observed
+        self.initializeParameterNode()
+
+    def exit(self):
+        """
+        Called each time the user opens a different module.
+        """
+        # Do not react to parameter node changes (GUI wlil be updated when the user enters into the module)
+        self.removeObserver(
+            self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+
+    def onSceneStartClose(self, caller, event):
+        """
+        Called just before the scene is closed.
+        """
+        # Parameter node will be reset, do not use it anymore
+        self.setParameterNode(None)
+
+    def onSceneEndClose(self, caller, event):
+        """
+        Called just after the scene is closed.
+        """
+        # If this module is shown while the scene is closed then recreate a new parameter node immediately
+        if self.parent.isEntered:
+          self.initializeParameterNode()
+
+    def initializeParameterNode(self):
+        """
+        Ensure parameter node exists and observed.
+        """
+        # Parameter node stores all user choices in parameter values, node selections, etc.
+        # so that when the scene is saved and reloaded, these settings are restored.
+
+        self.setParameterNode(self.logic.getParameterNode())
+
+        # Select default input nodes if nothing is selected yet to save a few clicks for the user
+        if not self._parameterNode.GetNodeReference("InputVolume"):
+            firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass(
+                "vtkMRMLScalarVolumeNode")
+            if firstVolumeNode:
+                self._parameterNode.SetNodeReferenceID(
+                    "InputVolume", firstVolumeNode.GetID())
+
+    def setParameterNode(self, inputParameterNode):
+        """
+        Set and observe parameter node.
+        Observation is needed because when the parameter node is changed then the GUI must be updated immediately.
+        """
+
+        if inputParameterNode:
+            self.logic.setDefaultParameters(inputParameterNode)
+
+        # Unobserve previously selected parameter node and add an observer to the newly selected.
+        # Changes of parameter node are observed so that whenever parameters are changed by a script or any other module
+        # those are reflected immediately in the GUI.
+        if self._parameterNode is not None:
+            self.removeObserver(
+                self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+        self._parameterNode = inputParameterNode
+        if self._parameterNode is not None:
+            self.addObserver(
+                self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+
+        # Initial GUI update
+        self.updateGUIFromParameterNode()
+
+    def updateGUIFromParameterNode(self, caller=None, event=None):
+        """
+        This method is called whenever parameter node is changed.
+        The module GUI is updated to show the current state of the parameter node.
+        """
+        if self._parameterNode is None or self._updatingGUIFromParameterNode:
+            return
+
+        # Make sure GUI changes do not call updateParameterNodeFromGUI (it could cause infinite loop)
+        self._updatingGUIFromParameterNode = True
+
+        # Update node selectors and sliders
+        self.ui.inputVolumeSelector.setCurrentNode(self._parameterNode.GetNodeReference("InputVolume"))
+        # Update only_forward_cls radio buttons
+        onlyForwardCls = self._parameterNode.GetParameter("OnlyForwardCls")
+        if onlyForwardCls == "true":
+            self.ui.onlyForwardClsYesRadio.setChecked(True)
+        else:
+            self.ui.onlyForwardClsNoRadio.setChecked(True)
+        
+        # Update to_merge_2_seg_task radio buttons
+        toMerge2SegTask = self._parameterNode.GetParameter("ToMerge2SegTask")
+        if toMerge2SegTask == "true":
+            self.ui.toMerge2SegTaskYesRadio.setChecked(True)
+        else:
+            self.ui.toMerge2SegTaskNoRadio.setChecked(True)
+        
+        # Update TTA type
+        ttaType = self._parameterNode.GetParameter("TtaType")
+        index = self.ui.ttaTypeComboBox.findText(ttaType)
+        if index >= 0:
+            self.ui.ttaTypeComboBox.setCurrentIndex(index)
+        
+        # Update TTA batch size
+        ttaBatchSize = self._parameterNode.GetParameter("TtaBatchSize")
+        bsIndex = self.ui.ttaBatchSizeComboBox.findText(ttaBatchSize)
+        if bsIndex >= 0:
+            self.ui.ttaBatchSizeComboBox.setCurrentIndex(bsIndex)
+
+        self.ui.cpuCheckBox.checked = self._parameterNode.GetParameter("CPU") == "true"
+        self.ui.useStandardSegmentNamesCheckBox.checked = self._parameterNode.GetParameter("UseStandardSegmentNames") == "true"
+        self.ui.outputSegmentationSelector.setCurrentNode(self._parameterNode.GetNodeReference("OutputSegmentation"))
+
+        # Update buttons states and tooltips
+        inputVolume = self._parameterNode.GetNodeReference("InputVolume")
+        if inputVolume:
+            self.ui.applyButton.toolTip = "Start segmentation"
+            self.ui.applyButton.enabled = True
+        else:
+            self.ui.applyButton.toolTip = "Select input volume"
+            self.ui.applyButton.enabled = False
+
+        if inputVolume:
+            self.ui.outputSegmentationSelector.baseName = inputVolume.GetName() + " segmentation"
+
+        # All the GUI updates are done
+        self._updatingGUIFromParameterNode = False
+
+    def updateParameterNodeFromGUI(self, caller=None, event=None):
+        """
+        This method is called when the user makes any change in the GUI.
+        The changes are saved into the parameter node (so that they are restored when the scene is saved and loaded).
+        """
+        if self._parameterNode is None or self._updatingGUIFromParameterNode:
+            return
+
+        wasModified = self._parameterNode.StartModify()  # Modify all properties in a single batch
+
+        self._parameterNode.SetNodeReferenceID("InputVolume", self.ui.inputVolumeSelector.currentNodeID)
+        
+        # Update only_forward_cls
+        self._parameterNode.SetParameter("OnlyForwardCls", "true" if self.ui.onlyForwardClsYesRadio.isChecked() else "false")
+        
+        # Update to_merge_2_seg_task
+        self._parameterNode.SetParameter("ToMerge2SegTask", "true" if self.ui.toMerge2SegTaskYesRadio.isChecked() else "false")
+        
+        # Update TTA type
+        self._parameterNode.SetParameter("TtaType", self.ui.ttaTypeComboBox.currentText)
+        
+        # Update TTA batch size
+        self._parameterNode.SetParameter("TtaBatchSize", self.ui.ttaBatchSizeComboBox.currentText)
+
+        self._parameterNode.SetParameter("CPU", "true" if self.ui.cpuCheckBox.checked else "false")
+        self._parameterNode.SetParameter("UseStandardSegmentNames", "true" if self.ui.useStandardSegmentNamesCheckBox.checked else "false")
+        self._parameterNode.SetNodeReferenceID("OutputSegmentation", self.ui.outputSegmentationSelector.currentNodeID)
+
+        self._parameterNode.EndModify(wasModified)
+
+
+    def onTtaTypeChanged(self):
+        """Update TTA batch size options based on selected TTA type"""
+        # Block signals to prevent updateParameterNodeFromGUI being called during update
+        self.ui.ttaBatchSizeComboBox.blockSignals(True)
+        
+        self.ui.ttaBatchSizeComboBox.clear()
+        
+        ttaType = self.ui.ttaTypeComboBox.currentText
+        
+        if ttaType == "TTAx1":
+            options = ["1"]
+        elif ttaType == "TTAx4":
+            options = ["1", "2", "3", "4"]
+        elif ttaType == "TTAx8":
+            options = ["1", "2", "3", "4", "5", "6", "7", "8"]
+        else:
+            options = ["1"]
+        
+        for opt in options:
+            self.ui.ttaBatchSizeComboBox.addItem(opt)
+        
+        # Unblock signals
+        self.ui.ttaBatchSizeComboBox.blockSignals(False)
+        
+        self.updateParameterNodeFromGUI()
+    
+    def addLog(self, text):
+        """Append text to log window
+        """
+        self.ui.statusLabel.appendPlainText(text)
+        slicer.app.processEvents()  # force update
+
+    def onApplyButton(self):
+        """
+        Run processing when user clicks "Apply" button.
+        """
+        self.ui.statusLabel.plainText = ''
+
+        onlyForwardCls = self.ui.onlyForwardClsYesRadio.isChecked()
+        toMerge2SegTask = self.ui.toMerge2SegTaskYesRadio.isChecked()
+        ttaType = self.ui.ttaTypeComboBox.currentText
+        ttaBatchSize = int(self.ui.ttaBatchSizeComboBox.currentText)
+
+        try:
+            slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+            self.logic.setupPythonRequirements()
+            slicer.app.restoreOverrideCursor()
+        except Exception as e:
+            slicer.app.restoreOverrideCursor()
+            import traceback
+            traceback.print_exc()
+            self.ui.statusLabel.appendPlainText(f"Failed to install Python dependencies:\n{e}\n")
+            restartRequired = False
+            if isinstance(e, InstallError):
+                restartRequired = e.restartRequired
+            if restartRequired:
+                self.ui.statusLabel.appendPlainText("\nApplication restart required.")
+                if slicer.util.confirmOkCancelDisplay(
+                    "Application is required to complete installation of required Python packages.\nPress OK to restart.",
+                    "Confirm application restart",
+                    detailedText=str(e)
+                    ):
+                    slicer.util.restart()
+                else:
+                    return
+            else:
+                slicer.util.errorDisplay(f"Failed to install required packages.\n\n{e}")
+                return
+
+        with slicer.util.tryWithErrorDisplay("Failed to compute results.", waitCursor=True):
+            # Create initial segmentation node if needed
+            if not self.ui.outputSegmentationSelector.currentNode():
+                self.ui.outputSegmentationSelector.addNode()
+
+            self.logic.useStandardSegmentNames = self.ui.useStandardSegmentNamesCheckBox.checked
+
+            segmentationNodes = self.logic.process(  #TODO: 
+                self.ui.inputVolumeSelector.currentNode(),
+                self.ui.outputSegmentationSelector.currentNode(),
+                self.ui.cpuCheckBox.checked,
+                onlyForwardCls=onlyForwardCls,
+                toMerge2SegTask=toMerge2SegTask,
+                ttaType=ttaType,
+                ttaBatchSize=ttaBatchSize
+            )
+
+            # Update UI with first node
+            if segmentationNodes and len(segmentationNodes) > 0:
+                self.ui.outputSegmentationSelector.setCurrentNode(segmentationNodes[0])
+
+        self.ui.statusLabel.appendPlainText(
+            f"\nProcessing finished. Created {len(segmentationNodes)} segmentation nodes."
+        )
+
+    def onPackageInfoUpdate(self):
+        self.ui.packageInfoTextBrowser.plainText = ''
+        with slicer.util.tryWithErrorDisplay("Failed to get BraveCowCow package version information", waitCursor=True):
+            self.ui.packageInfoTextBrowser.plainText = self.logic.installedBraveCowCowPythonPackageInfo().rstrip()
+
+    def onPackageUpgrade(self):
+        with slicer.util.tryWithErrorDisplay("Failed to upgrade BraveCowCow package", waitCursor=True):
+            self.logic.setupPythonRequirements(upgrade=True)
+        self.onPackageInfoUpdate()
+        if not slicer.util.confirmOkCancelDisplay(f"BraveCowCow package update requires a 3D Slicer restart.","Press OK to restart."):
+            raise ValueError('Restart was cancelled.')
+        else:
+            slicer.util.restart()
+
+class InstallError(Exception):
+    def __init__(self, message, restartRequired=False):
+        # Call the base class constructor with the parameters it needs
+        super().__init__(message)
+        self.message = message
+        self.restartRequired = restartRequired
+    def __str__(self):
+        return self.message
+
+
+class BraveCowCowLogic(ScriptedLoadableModuleLogic):
+    _requirements_checked = False  # static variable to ensure that requirements are checked only once
+   
+    def __init__(self):
+        """
+        Called when the logic class is instantiated. Can be used for initializing member variables.
+        """
+        ScriptedLoadableModuleLogic.__init__(self)
+        self.isSingletonParameterNode = True
+
+        from collections import OrderedDict
+
+        #TODO: BraveCowCow package (script, setup.py, model weights download...) update this in every release (also remember to update version number in setup.py)
+        self.bravecowcowPythonPackageDownloadUrl = "https://github.com/murong-xu/CADS/archive/29d90ca04216cd2ea8782a5dfb9e4893b54ba829.zip"  # version 1.02 2025-12-15  #TODO: 
+
+        self.logCallback = None
+        self.clearOutputFolder = True
+        self.useStandardSegmentNames = True
+        self.pullMaster = False
+
+        # List of property type codes that are specified by in the BraveCowCow terminology.
+        # If property the code is found in this list then the BraveCowCow terminology will be used,
+        # otherwise the DICOM terminology will be used. This is necessary because the DICOM terminology
+        # does not contain all the necessary items and some items are incomplete (e.g., don't have color or 3D Slicer label).
+        self.bravecowcowTerminologyPropertyTypes = []
+
+        # Map from BraveCowCow structure name to terminology string.
+        # Terminology string uses Slicer terminology entry format - see specification at
+        # https://slicer.readthedocs.io/en/latest/developer_guide/modules/segmentations.html#terminologyentry-tag
+        self.bravecowcowLabelTerminology = {}
+
+        # Segmentation tasks specified by BraveCowCow
+        # Ideally, this information should be provided by BraveCowCow itself.
+        self.tasks = OrderedDict()
+
+        # Define available tasks
+        self.loadBraveCowCowLabelTerminology()
+
+    
+    def loadBraveCowCowLabelTerminology(self):
+        """Load label terminology from bravecowcow_snomed_mapping.csv file.
+        Terminology entries are either in DICOM or BraveCowCow "Segmentation category and type".
+        """
+        moduleDir = os.path.dirname(slicer.util.getModule('BraveCowCow').path)
+        bravecowcowTerminologyMappingFilePath = os.path.join(moduleDir, 'Resources', 'bravecowcow_snomed_mapping.csv')
+        bravecowcowTerminologyFilePath = os.path.join(moduleDir, 'Resources', 'SegmentationCategoryTypeModifier-BRAVECOWCOW.term.json')
+
+        # load .term.json
+        tlogic = slicer.modules.terminologies.logic()
+        terminologyName = tlogic.LoadTerminologyFromFile(bravecowcowTerminologyFilePath)
+
+        # Helper function to get code string from CSV file row
+        def getCodeString(field, columnNames, row):
+            columnValues = []
+            for fieldName in ["CodingSchemeDesignator", "CodeValue", "CodeMeaning"]:
+                columnIndex = columnNames.index(f"{field}.{fieldName}")
+                try:
+                    columnValue = row[columnIndex]
+                except IndexError:
+                    columnValue = ''
+                columnValues.append(columnValue)
+            return columnValues
+
+        # Load the terminology mappings from CSV
+        import csv
+        with open(bravecowcowTerminologyMappingFilePath, "r") as f:
+            reader = csv.reader(f)
+            columnNames = next(reader)
+            
+            for row in reader:
+                try:
+                    terminologyEntryStrWithoutCategoryName = (
+                        "~"
+                        + '^'.join(getCodeString("SegmentedPropertyCategoryCodeSequence", columnNames, row))
+                        + '~'
+                        + '^'.join(getCodeString("SegmentedPropertyTypeCodeSequence", columnNames, row))
+                        + '~'
+                        + '^'.join(getCodeString("SegmentedPropertyTypeModifierCodeSequence", columnNames, row))
+                        + '~Anatomic codes - DICOM master list'
+                        + '~'
+                        + '^'.join(getCodeString("AnatomicRegionSequence", columnNames, row))
+                        + '~'
+                        + '^'.join(getCodeString("AnatomicRegionModifierSequence", columnNames, row))
+                        + '|'
+                    )
+
+                    # Get Structure name and code values
+                    structure_name = row[columnNames.index("Structure")]
+                    category_code = row[columnNames.index("SegmentedPropertyCategoryCodeSequence.CodeValue")]
+                    type_code = row[columnNames.index("SegmentedPropertyTypeCodeSequence.CodeValue")]
+                    
+                    category = slicer.vtkSlicerTerminologyCategory()
+                    type_object = slicer.vtkSlicerTerminologyType()
+                    slicer_label = structure_name  # default: using model's structure_name as slicer display name
+                    
+                    # retrieve slicer labels 
+                    numberOfCategories = tlogic.GetNumberOfCategoriesInTerminology(terminologyName)
+                    for i in range(numberOfCategories):
+                        tlogic.GetNthCategoryInTerminology(terminologyName, i, category)
+                        if category.GetCodeValue() == category_code:
+                            numberOfTypes = tlogic.GetNumberOfTypesInTerminologyCategory(terminologyName, category)
+                            for j in range(numberOfTypes):
+                                tlogic.GetNthTypeInTerminologyCategory(terminologyName, category, j, type_object)
+                                if type_object.GetCodeValue() == type_code:
+                                    # first, get base label name (e.g. Kidney)
+                                    base_label = type_object.GetSlicerLabel() or type_object.GetCodeMeaning()
+                                    # then, check if modifier code available (left/right)
+                                    modifier_code = row[columnNames.index("SegmentedPropertyTypeModifierCodeSequence.CodeValue")]
+                                    if modifier_code:
+                                        type_modifier = slicer.vtkSlicerTerminologyType()
+                                        numberOfModifiers = tlogic.GetNumberOfTypeModifiersInTerminologyType(
+                                            terminologyName, 
+                                            category, 
+                                            type_object
+                                        )
+                                        for k in range(numberOfModifiers):
+                                            tlogic.GetNthTypeModifierInTerminologyType(
+                                                terminologyName,
+                                                category,
+                                                type_object,
+                                                k,
+                                                type_modifier
+                                            )
+                                            if type_modifier.GetCodeValue() == modifier_code:
+                                                slicer_label = type_modifier.GetSlicerLabel() or type_modifier.GetCodeMeaning()
+                                                break
+                                    else:
+                                        slicer_label = base_label
+                                    break
+                    
+                    # Store terminology string and mapping information
+                    self.bravecowcowLabelTerminology[structure_name] = {
+                        'terminologyStr': "Segmentation category and type - BraveCowCow" + terminologyEntryStrWithoutCategoryName,
+                        'slicerLabel': slicer_label
+                    }
+                    
+                except Exception as e:
+                    logging.warning(f"Error processing row in terminology CSV: {str(e)}")
+
+    def getSlicerLabel(self, structure_name):
+        """Get Slicer display label for a structure"""
+        if structure_name in self.bravecowcowLabelTerminology:
+            return self.bravecowcowLabelTerminology[structure_name]['slicerLabel']
+        return structure_name
+
+    def getStructureName(self, slicer_label):
+        """Get structure name from Slicer display label"""
+        for structure_name, info in self.bravecowcowLabelTerminology.items():
+            if info['slicerLabel'] == slicer_label:
+                return structure_name
+        return slicer_label
+
+    def getTerminologyString(self, structure_name):
+        """Get terminology string for a structure"""
+        if structure_name in self.bravecowcowLabelTerminology:
+            return self.bravecowcowLabelTerminology[structure_name]['terminologyStr']
+        return None
+  
+    def getSegmentLabelColor(self, terminologyEntryStr):
+        """Get segment label and color from terminology"""
+
+        def labelColorFromTypeObject(typeObject):
+            """typeObject is a terminology type or type modifier"""
+            label = typeObject.GetSlicerLabel() if typeObject.GetSlicerLabel() else typeObject.GetCodeMeaning()
+            rgb = typeObject.GetRecommendedDisplayRGBValue()
+            return label, (rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0)
+
+        tlogic = slicer.modules.terminologies.logic()
+
+        terminologyEntry = slicer.vtkSlicerTerminologyEntry()
+        if not tlogic.DeserializeTerminologyEntry(terminologyEntryStr, terminologyEntry):
+            raise RuntimeError(f"Failed to deserialize terminology string: {terminologyEntryStr}")
+
+        numberOfTypes = tlogic.GetNumberOfTypesInTerminologyCategory(terminologyEntry.GetTerminologyContextName(), terminologyEntry.GetCategoryObject())
+        foundTerminologyEntry = slicer.vtkSlicerTerminologyEntry()
+        for typeIndex in range(numberOfTypes):
+            tlogic.GetNthTypeInTerminologyCategory(terminologyEntry.GetTerminologyContextName(), terminologyEntry.GetCategoryObject(), typeIndex, foundTerminologyEntry.GetTypeObject())
+            if terminologyEntry.GetTypeObject().GetCodingSchemeDesignator() != foundTerminologyEntry.GetTypeObject().GetCodingSchemeDesignator():
+                continue
+            if terminologyEntry.GetTypeObject().GetCodeValue() != foundTerminologyEntry.GetTypeObject().GetCodeValue():
+                continue
+            if terminologyEntry.GetTypeModifierObject() and terminologyEntry.GetTypeModifierObject().GetCodeValue():
+                # Type has a modifier, get the color from there
+                numberOfModifiers = tlogic.GetNumberOfTypeModifiersInTerminologyType(terminologyEntry.GetTerminologyContextName(), terminologyEntry.GetCategoryObject(), terminologyEntry.GetTypeObject())
+                foundMatchingModifier = False
+                for modifierIndex in range(numberOfModifiers):
+                    tlogic.GetNthTypeModifierInTerminologyType(terminologyEntry.GetTerminologyContextName(), terminologyEntry.GetCategoryObject(), terminologyEntry.GetTypeObject(),
+                        modifierIndex, foundTerminologyEntry.GetTypeModifierObject())
+                    if terminologyEntry.GetTypeModifierObject().GetCodingSchemeDesignator() != foundTerminologyEntry.GetTypeModifierObject().GetCodingSchemeDesignator():
+                        continue
+                    if terminologyEntry.GetTypeModifierObject().GetCodeValue() != foundTerminologyEntry.GetTypeModifierObject().GetCodeValue():
+                        continue
+                    return labelColorFromTypeObject(foundTerminologyEntry.GetTypeModifierObject())
+                continue
+            return labelColorFromTypeObject(foundTerminologyEntry.GetTypeObject())
+
+        raise RuntimeError(f"Color was not found for terminology {terminologyEntryStr}")
+
+    def log(self, text):
+        logging.info(text)
+        if self.logCallback:
+            self.logCallback(text)
+
+    def installedBraveCowCowPythonPackageDownloadUrl(self):
+        """Get package download URL of the installed BraveCowCow Python package"""
+        import importlib.metadata
+        import json
+        try:
+            metadataPath = [p for p in importlib.metadata.files('BraveCowCow') if 'direct_url.json' in str(p)][0]  #TODO: check if correct
+            with open(metadataPath.locate()) as json_file:
+                data = json.load(json_file)
+            return data['url']
+        except:
+            # Failed to get version information, probably not installed from download URL
+            return None
+
+    def installedBraveCowCowPythonPackageInfo(self):
+        import shutil
+        import subprocess
+        versionInfo = subprocess.check_output([shutil.which('PythonSlicer'), "-m", "pip", "show", "BraveCowCow"]).decode()  # read the version info from setup.py
+
+        return versionInfo
+
+    def simpleITKPythonPackageVersion(self):
+        """Utility function to get version of currently installed SimpleITK.
+        Currently not used, but it can be useful for diagnostic purposes.
+        """
+
+        import shutil
+        import subprocess
+        versionInfo = subprocess.check_output([shutil.which('PythonSlicer'), "-m", "pip", "show", "SimpleITK"]).decode()
+
+        # versionInfo looks something like this:
+        #
+        #   Name: SimpleITK
+        #   Version: 2.2.0rc2.dev368
+        #   Summary: SimpleITK is a simplified interface to the Insight Toolkit (ITK) for image registration and segmentation
+        #   ...
+        #
+
+        # Get version string (second half of the second line):
+        version = versionInfo.split('\n')[1].split(' ')[1].strip()
+        return version
+
+    def pipInstallSelectiveFromURL(self, packageToInstall, installURL, packagesToSkip):
+        """Installs a Python package from a local zip file or URL, skipping specified packages.
+        Records original source URL in package metadata.
+        """
+        import os
+        import pathlib
+        import zipfile
+        import tempfile
+        import urllib.request
+        import json
+        import shutil
+        import importlib.metadata
+        import re
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                # Download or copy zip file
+                zip_path = os.path.join(temp_dir, "package.zip")
+                if installURL.startswith(('http://', 'https://')):
+                    self.log(f'Downloading package from {installURL}...')
+                    urllib.request.urlretrieve(installURL, zip_path)
+                    source_url = installURL
+                else:
+                    self.log(f'Copying package from {installURL}...')
+                    shutil.copy2(installURL, zip_path)
+                    source_url = installURL
+                    
+                # Extract and find setup files
+                self.log('Extracting package...')
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+
+                # Look for setup files
+                package_dir = None
+                for root, _, files in os.walk(temp_dir):
+                    if any(f in files for f in ['setup.py', 'pyproject.toml']):
+                        package_dir = root
+                        break
+                    
+                if not package_dir:
+                    raise ValueError(f"No setup.py or pyproject.toml found in {installURL}")
+
+                # First install the package without dependencies
+                self.log(f'Installing {packageToInstall}...')
+                install_path = pathlib.Path(package_dir).as_posix()
+                slicer.util.pip_install(f"{install_path} --no-deps")
+
+                # Now create and add direct_url.json to the installed package's dist-info
+                try:
+                    # Find the package's dist-info directory
+                    dist_info_dir = None
+                    for path in importlib.metadata.files(packageToInstall):
+                        if '.dist-info' in str(path):
+                            dist_info_dir = os.path.dirname(path.locate())
+                            break
+                    
+                    if not dist_info_dir:
+                        raise RuntimeError(f"Could not find dist-info directory for {packageToInstall}")
+
+                    # Create direct_url.json content
+                    direct_url_data = {
+                        "url": source_url,  # need to overwrite the tmp dir generated by pip install a local file
+                        "dir_info": {
+                            "editable": False
+                        },
+                        "vcs_info": {
+                            "vcs": "git",
+                            "requested_revision": None,
+                            "commit_id": None
+                        }
+                    }
+                    
+                    # Save direct_url.json in the dist-info directory
+                    direct_url_path = os.path.join(dist_info_dir, "direct_url.json")
+                    self.log(f'Creating direct_url.json at: {direct_url_path}')
+                    with open(direct_url_path, 'w') as f:
+                        json.dump(direct_url_data, f)
+
+                except Exception as e:
+                    self.log(f'Warning: Failed to create direct_url.json: {str(e)}')
+                    # Continue with installation even if direct_url.json creation fails
+
+                # Process metadata to skip packages
+                skippedRequirements = []
+                try:
+                    metadataPath = [p for p in importlib.metadata.files(packageToInstall) if 'METADATA' in str(p)][0]
+                except (IndexError, ImportError) as e:
+                    raise RuntimeError(f"Could not find metadata for {packageToInstall}") from e
+
+                # Filter requirements in metadata
+                self.log('Processing package dependencies...')
+                filteredMetadata = ""
+                with open(metadataPath.locate(), "r+", encoding="latin1") as file:
+                    for line in file:
+                        skipThisPackage = False
+                        requirementPrefix = 'Requires-Dist: '
+                        
+                        if line.startswith(requirementPrefix):
+                            # Skip dev dependencies
+                            if '; extra == "dev"' in line:
+                                continue
+                                
+                            # Check if package should be skipped
+                            for packageToSkip in packagesToSkip:
+                                if packageToSkip in line:
+                                    skipThisPackage = True
+                                    skippedRequirements.append(line.removeprefix(requirementPrefix))
+                                    break
+                                    
+                        if not skipThisPackage:
+                            filteredMetadata += line
+                            
+                    # Update metadata file
+                    file.seek(0)
+                    file.write(filteredMetadata)
+                    file.truncate()
+
+                # Install remaining dependencies
+                requirements = importlib.metadata.requires(packageToInstall) or []
+                for requirement in requirements:
+                    # Skip dev dependencies
+                    if '; extra == "dev"' in requirement:
+                        continue
+                        
+                    # Check if package should be skipped
+                    skipThisPackage = any(requirement.startswith(pkg) for pkg in packagesToSkip)
+                    
+                    if not skipThisPackage:
+                        # Clean up requirement string
+                        if '; extra == ' in requirement:
+                            pkg, extra = re.match(r"([\S]+)[\s]*; extra == '([^']+)'", requirement).groups()
+                            requirement = f"{pkg}[{extra}]"
+                        else:
+                            match = re.match(r"([\S]+)[\s](.+)", requirement)
+                            if match:
+                                requirement = f"{match.group(1)}{match.group(2)}"
+                                
+                        self.log(f'Installing dependency: {requirement}')
+                        slicer.util.pip_install(requirement)
+                    else:
+                        self.log(f'Skipping dependency: {requirement}')
+
+                try:
+                    bravecowcow_path = importlib.metadata.files('bravecowcow')[0].locate().parent
+                    json_path = os.path.join(bravecowcow_path, 'skipped_requirements.json')
+                    with open(json_path, 'w') as f:
+                        json.dump(skippedRequirements, f)
+                except Exception as e:
+                    print(f"Failed to save skipped requirements: {e}")
+
+                return skippedRequirements
+
+            except urllib.error.URLError as e:
+                self.log(f'Error downloading package: {str(e)}')
+                raise RuntimeError(f"Failed to download package from {installURL}") from e
+            
+            except zipfile.BadZipFile as e:
+                self.log(f'Error extracting package: {str(e)}')
+                raise RuntimeError(f"The file at {installURL} is not a valid zip file") from e
+                
+            except json.JSONDecodeError as e:
+                self.log(f'Error creating direct_url.json: {str(e)}')
+                raise RuntimeError("Failed to create package metadata") from e
+                
+            except OSError as e:
+                self.log(f'File system error: {str(e)}')
+                raise RuntimeError(f"File system error while installing package: {str(e)}") from e
+                
+            except Exception as e:
+                self.log(f'Unexpected error during installation: {str(e)}')
+                raise RuntimeError(f"Failed to install package: {str(e)}") from e
+
+    def _parse_version_from_requirements(self, package_name, requirements_list):
+        """
+        Extract package version declaration such as 'TPTBox==0.3.0', 'TPTBox==0.3.0; python_version<"3.10"'from requirements_list.
+        """
+        from packaging.requirements import Requirement
+
+        results = []
+        norm = lambda s: re.sub(r'[-_]+', '-', s).lower()
+        target = norm(package_name)
+
+        for raw in requirements_list:
+            try:
+                req = Requirement(raw)
+            except Exception:
+                fixed = raw.replace('(', '').replace(')', '').replace(' ', '')
+                try:
+                    req = Requirement(fixed)
+                except Exception:
+                    continue
+            if norm(req.name) != target:
+                continue
+            ver = None
+            for spec in req.specifier:
+                if spec.operator == '==':
+                    ver = spec.version
+                    break
+            if not ver:
+                continue
+
+            results.append((ver, req.marker))
+        return results
+
+    def _should_install_version(self, version_info):
+        """
+        version_info = (version_str, marker_or_None)
+        """
+        from packaging.markers import default_environment
+        _, marker = version_info
+        if not marker:
+            return True
+        try:
+            return marker.evaluate(default_environment())
+        except Exception:
+            return False
+        
+    def load_skipped_requirements(self):
+        import importlib.metadata
+        import json
+        # Get the path to the installed 'bravecowcow' package
+        bravecowcow_path = importlib.metadata.files('bravecowcow')[0].locate().parent  #TODO: 
+        json_path = os.path.join(bravecowcow_path, 'skipped_requirements.json')
+        
+        # Read the skipped requirements from the JSON file
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                return json.load(f)
+        else:
+            raise FileNotFoundError("Skipped requirements file not found.")
+
+    def setupPythonRequirements(self, upgrade=False):
+        if self.__class__._requirements_checked and not upgrade: # if already checked and not upgrading, then skip
+            return
+        
+        import re
+        import importlib.metadata
+        from packaging import version
+
+        # Step 1) Install base dependencies first
+        # To avoid repeated uninstall/install of packages, we specify exact versions of some packages
+        base_packages = [
+            "numpy==1.26.4",
+            "scikit-image==0.22.0",
+        ]
+        for package in base_packages:
+            self.log(f'Installing {package}...')
+            slicer.util.pip_install(package)
+
+        # Step 2) acvl_utils workaround
+        # Recent versions of acvl_utils are broken (https://github.com/MIC-DKFZ/acvl_utils/issues/2).
+        # As a workaround, we install an older version manually. This workaround can be removed after acvl_utils is fixed.
+        needToInstallAcvlUtils = True
+        try:
+            if version.parse(importlib.metadata.version("acvl_utils")) == version.parse("0.2"):
+                # A suitable version is already installed
+                needToInstallAcvlUtils = False
+        except Exception as e:
+            pass
+        if needToInstallAcvlUtils:
+            slicer.util.pip_install("acvl_utils==0.2")
+
+        # Step 3) Check PyTorch
+        try:
+            import torch
+            minimumTorchVersion = "1.12"
+            if version.parse(torch.__version__) < version.parse(minimumTorchVersion):
+                raise InstallError(f'PyTorch version {torch.__version__} is not compatible with this module.'
+                                + f' Minimum required version is {minimumTorchVersion}.')
+        except ImportError:
+            raise InstallError("This module requires PyTorch. Please install it from the Extensions Manager.")
+
+        # Step 4) Install BraveCowCow and its dependencies
+        # Some packages are pre-installed in Slicer, or we need to manually install
+        packagesToSkip = [
+            'SimpleITK',  # Slicer's SimpleITK uses a special IO class, which should not be replaced
+            'torch',  # needs special installation using SlicerPyTorch
+            'requests',  # CADS would want to force a specific version of requests, which would require a restart of Slicer and it is unnecessary
+            'acvl-utils', # Version corrected below (acvl-utils can have a slightly different name after pip-install's name standarziation, - or _)
+            'acvl_utils',
+            'nnunetv2', # needs special installation using nnUNet module
+            'TPTBox', # Version corrected below
+            ]
+
+        needToInstallSegmenter = False  # initial installation flag of BraveCowCow
+        try:
+            import bravecowcow #TODO: 
+            if not upgrade: # update flag of BraveCowCow
+                # Check if we need to update BraveCowCow Python package version
+                downloadUrl = self.installedBraveCowCowPythonPackageDownloadUrl()
+                if downloadUrl and (downloadUrl != self.bravecowcowPythonPackageDownloadUrl):
+                    # BraveCowCow have been already installed from GitHub, from a different URL that this module needs
+                    if not slicer.util.confirmOkCancelDisplay(
+                        f"This module requires BraveCowCow Python package update.",
+                        detailedText=f"Currently installed: {downloadUrl}\n\nRequired: {self.bravecowcowPythonPackageDownloadUrl}"):
+                      raise ValueError('BraveCowCow update was cancelled.')
+                    upgrade = True
+        except ModuleNotFoundError as e:
+            needToInstallSegmenter = True
+        if needToInstallSegmenter or upgrade:
+            self.log(f'BraveCowCow Python package is required. Installing it from {self.bravecowcowPythonPackageDownloadUrl}... (it may take several minutes)')
+
+            if upgrade:
+                # BraveCowCow version information is usually not updated with each git revision, therefore we must uninstall it to force the upgrade
+                slicer.util.pip_uninstall("BraveCowCow")
+
+            # Update BraveCowCow and all its dependencies
+            skippedRequirements = self.pipInstallSelectiveFromURL(
+                "BraveCowCow",
+                self.bravecowcowPythonPackageDownloadUrl,
+                packagesToSkip)
+
+            # Install TPTBox separately 
+            tptbox_versions = self._parse_version_from_requirements('TPTBox', skippedRequirements)    
+            required_version = None
+            for version_info in tptbox_versions:
+                if self._should_install_version(version_info):
+                    required_version = version_info[0]
+                    break
+            
+            if not required_version:
+                raise ValueError("No suitable TPTBox version found for current Python version")
+
+            needToInstallTPTBox = True
+            try:
+                import TPTBox
+                if TPTBox.__version__ == required_version:
+                    needToInstallTPTBox = False
+            except (ImportError, AttributeError):
+                pass
+
+            if needToInstallTPTBox:
+                self.log(f'Installing TPTBox version {required_version}...')
+                slicer.util.pip_install(f"TPTBox=={required_version}")
+
+        # Step 5) Check nnUNet
+        try:
+            import nnunetv2
+            skippedRequirements = self.load_skipped_requirements()
+            nnunet_versions = self._parse_version_from_requirements('nnunetv2', skippedRequirements)    
+            required_version = None
+            for version_info in nnunet_versions:
+                if self._should_install_version(version_info):
+                    required_version = version_info[0]
+                    break
+            installed_version = importlib.metadata.version("nnunetv2")
+            if version.parse(installed_version) != version.parse(required_version):
+                raise InstallError(f'nnUNet version {installed_version} is not compatible with this module.'
+                                + f' Required version is {required_version}.')
+        except ImportError:
+            raise InstallError("This module requires nnUNet. Please install it from the Extensions Manager.")
+        
+        # Step 6) Workaround: fix incompatibility or package not found of dynamic_network_architectures
+        # Revert to the last working version: dynamic_network_architectures==0.2.0 (or can be 0.3.1 I think)
+        try:
+            installed_version = importlib.metadata.version("dynamic_network_architectures")
+            if version.parse(installed_version) == version.parse("0.4"):
+                raise importlib.metadata.PackageNotFoundError
+        except importlib.metadata.PackageNotFoundError:
+            self.log(f'dynamic_network_architectures package version is incompatible or not installed. Installing working version...')
+            slicer.util.pip_install("dynamic_network_architectures==0.2.0")
+
+        self.log('BraveCowCow installation completed successfully.')
+        self.__class__._requirements_checked = True
+
+
+    def setDefaultParameters(self, parameterNode):
+        """
+        Initialize parameter node with default settings.
+        """
+        if not parameterNode.GetParameter("OnlyForwardCls"):
+            parameterNode.SetParameter("OnlyForwardCls", "false")
+        if not parameterNode.GetParameter("ToMerge2SegTask"):
+            parameterNode.SetParameter("ToMerge2SegTask", "false")
+        if not parameterNode.GetParameter("TtaType"):
+            parameterNode.SetParameter("TtaType", "TTAx1")
+        if not parameterNode.GetParameter("TtaBatchSize"):
+            parameterNode.SetParameter("TtaBatchSize", "1") 
+        if not parameterNode.GetParameter("UseStandardSegmentNames"):
+            parameterNode.SetParameter("UseStandardSegmentNames", "true")
+        if not parameterNode.GetParameter("CPU"):
+            parameterNode.SetParameter("CPU", "false")
+
+    def logProcessOutput(self, proc, returnOutput=False):
+        # Wait for the process to end and forward output to the log
+        output = ""
+        from subprocess import CalledProcessError
+        while True:
+            try:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if returnOutput:
+                    output += line
+                self.log(line.rstrip())
+            except UnicodeDecodeError as e:
+                # Code page conversion happens because `universal_newlines=True` sets process output to text mode,
+                # and it fails because probably system locale is not UTF8. We just ignore the error and discard the string,
+                # as we only guarantee correct behavior if an UTF8 locale is used.
+                pass
+
+        proc.wait()
+        retcode = proc.returncode
+        if retcode != 0:
+            raise CalledProcessError(retcode, proc.args, output=proc.stdout, stderr=proc.stderr)
+        return output if returnOutput else None
+
+    @staticmethod
+    def executableName(name):
+        return name + ".exe" if os.name == "nt" else name
+
+    def process(self, inputVolume, outputSegmentation, cpu=False, 
+            onlyForwardCls=False, toMerge2SegTask=False, 
+            ttaType="TTAx1", ttaBatchSize=1):  #TODO: 
+        """
+        Run the processing algorithm.
+        Parameters:
+            inputVolume: Input volume node
+            outputSegmentation: Initial segmentation node
+            cpu: Whether to use CPU instead of GPU
+            task: Task ID to run
+        Returns:
+            List of created segmentation nodes
+        """
+        if not inputVolume:
+            raise ValueError("Input volume is invalid")
+            
+        import time
+        startTime = time.time()
+        self.log('Processing started')
+
+        # Create temporary folder - moved here so it can be shared across tasks
+        tempFolder = slicer.util.tempDirectory()
+        inputFile = os.path.join(tempFolder, "bravecowcow-input-image.nii.gz")
+        outputSegmentationFolder = os.path.join(tempFolder, "bravecowcow-input-image")
+
+        # Get Python and BraveCowCow paths
+        import sysconfig
+        import shutil
+        pythonSlicerExecutablePath = shutil.which('PythonSlicer')
+        if not pythonSlicerExecutablePath:
+            raise RuntimeError("Python was not found")
+        bravecowcowExecutablePath = os.path.join(sysconfig.get_path('scripts'), 
+                                        self.executableName("BraveCoWCoWSlicer"))
+        bravecowcowCommand = [pythonSlicerExecutablePath, bravecowcowExecutablePath]
+
+        try:
+            segmentationNodes = []
+            self.log(f"Writing input file to {inputFile}")
+            volumeStorageNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            volumeStorageNode.SetFileName(inputFile)
+            volumeStorageNode.UseCompressionOff()
+            volumeStorageNode.WriteData(inputVolume)
+            volumeStorageNode.UnRegister(None)
+
+            segmentationNodes = self.processVolume(
+                inputFile, inputVolume,
+                outputSegmentationFolder, outputSegmentation,
+                task, subset, cpu, bravecowcowCommand
+            )
+
+            stopTime = time.time()
+            self.log(f"Processing completed in {stopTime-startTime:.2f} seconds")
+
+            return segmentationNodes
+
+        except Exception as e:
+            self.log(f"Error during processing: {str(e)}")
+            raise
+
+        finally:
+            # Cleanup temp folder after all processing is complete
+            if self.clearOutputFolder:
+                self.log("Cleaning up temporary folder...")
+                if os.path.isdir(tempFolder):
+                    shutil.rmtree(tempFolder)
+            else:
+                self.log(f"Not cleaning up temporary folder: {tempFolder}")
+
+    
+    def processVolume(self, inputFile, inputVolume, outputSegmentationFolder, outputSegmentation, task, subset, cpu, bravecowcowCommand):  #TODO: 
+        """Segment a single volume
+        """
+        # Write input volume to file
+        # if converts to NIFTI?
+        # volumeStorageNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+        # volumeStorageNode.SetFileName(inputFile)
+        # volumeStorageNode.UseCompressionOff()
+        # volumeStorageNode.WriteData(inputVolume)
+        # volumeStorageNode.UnRegister(None)
+
+        # Get options
+        output_bravecowcow_parent_folder = os.path.dirname(outputSegmentationFolder)
+        options = ["-i", inputFile, "-o", output_bravecowcow_parent_folder]
+        if cpu:
+            options.extend(["--cpu"])
+
+        # Launch BraveCowCow
+
+        # When there are many segments then reading each segment from a separate file would be too slow,
+        # but we need to do it for some specialized models.
+        self.log('BraveCowCow-model is segmenting...')
+        self.log(f"BraveCowCow arguments: {options}")
+        proc = slicer.util.launchConsoleProcess(bravecowcowCommand + options)
+        self.logProcessOutput(proc)
+
+        # Load result
+        self.log('Importing segmentation results...')
+        readSegmentationIntoSlicer = self.readSegmentation(
+            outputSegmentation,
+            outputSegmentationFolder,
+            task,
+            subset
+            )
+        
+        if not readSegmentationIntoSlicer:
+            return []
+    
+        # Set source volume - required for DICOM Segmentation export
+        outputSegmentation.SetNodeReferenceID(outputSegmentation.GetReferenceImageGeometryReferenceRole(), inputVolume.GetID())
+        outputSegmentation.SetReferenceImageGeometryParameterFromVolumeNode(inputVolume)
+
+        # Place segmentation node in the same place as the input volume
+        shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
+        inputVolumeShItem = shNode.GetItemByDataNode(inputVolume)
+        studyShItem = shNode.GetItemParent(inputVolumeShItem)
+        segmentationShItem = shNode.GetItemByDataNode(outputSegmentation)
+        shNode.SetItemParent(segmentationShItem, studyShItem)
+
+        return [outputSegmentation]
+
+    def _setSegmentationNodeProperties(self, segmentationNode, inputVolume):
+        """Helper method to set common properties for segmentation nodes"""
+        # Set source volume reference
+        segmentationNode.SetNodeReferenceID(
+            segmentationNode.GetReferenceImageGeometryReferenceRole(),
+            inputVolume.GetID()
+        )
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(inputVolume)
+
+        # Set scene placement
+        shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
+        inputVolumeShItem = shNode.GetItemByDataNode(inputVolume)
+        studyShItem = shNode.GetItemParent(inputVolumeShItem)
+        segmentationShItem = shNode.GetItemByDataNode(segmentationNode)
+        shNode.SetItemParent(segmentationShItem, studyShItem)
+        
+    def readSegmentation(self, outputSegmentation, outputSegmentationFolder, task, subset=None):  #TODO: 
+        # Get label descriptions
+        from bravecowcow.dataset_utils.bodyparts_labelmaps import map_taskid_to_labelmaps
+        labelValueToSegmentName = map_taskid_to_labelmaps[int(task)]
+
+        # Filter by subset if provided
+        if subset is not None:
+            labelValueToSegmentName = {k: v for k, v in labelValueToSegmentName.items() if self.getSlicerLabel(v) in subset}
+            if not labelValueToSegmentName:
+                logging.info(f"Task {task}: No selected targets were found in the label map, skipping...")
+                return False
+        
+        maxLabelValue = max(labelValueToSegmentName.keys())
+        if min(labelValueToSegmentName.keys()) < 0:
+            raise RuntimeError("Label values in class_map must be positive")
+
+        # Get color node with random colors
+        randomColorsNode = slicer.mrmlScene.GetNodeByID('vtkMRMLColorTableNodeRandom')
+        rgba = [0, 0, 0, 0]
+
+        pattern = os.path.join(outputSegmentationFolder, f'*{task}*.nii.gz')
+        matching_files = glob.glob(pattern)
+        if len(matching_files) == 0:
+            self.log(f"Error: No segmentation file found for task {task} in {outputSegmentationFolder}")
+            return False
+        elif len(matching_files) > 1:
+            self.log(f"Warning: Multiple segmentation files found for task {task}:")
+            for f in matching_files:
+                self.log(f"  - {os.path.basename(f)}")
+            self.log(f"Using the first file: {os.path.basename(matching_files[0])}")
+        outputSegmentationFile = matching_files[0]
+
+        # Create color table for this segmentation task (only for selected subset)
+        colorTableNode = slicer.vtkMRMLColorTableNode()
+        colorTableNode.SetTypeToUser()
+        colorTableNode.SetNumberOfColors(maxLabelValue+1)
+        colorTableNode.SetName(str(task))
+        for labelValue in labelValueToSegmentName:
+            randomColorsNode.GetColor(labelValue,rgba)
+            colorTableNode.SetColor(labelValue, rgba[0], rgba[1], rgba[2], rgba[3])
+            colorTableNode.SetColorName(labelValue, labelValueToSegmentName[labelValue])
+        slicer.mrmlScene.AddNode(colorTableNode)
+
+        # Load the segmentation
+        outputSegmentation.SetLabelmapConversionColorTableNodeID(colorTableNode.GetID())
+        outputSegmentation.AddDefaultStorageNode()
+        storageNode = outputSegmentation.GetStorageNode()
+        storageNode.SetFileName(outputSegmentationFile)
+        storageNode.ReadData(outputSegmentation)
+
+        # Remove segments that are not in the subset
+        segmentation = outputSegmentation.GetSegmentation()
+        segmentIDs = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(segmentIDs)
+        for i in range(segmentIDs.GetNumberOfValues()):
+            segmentID = segmentIDs.GetValue(i)
+            if segmentID not in labelValueToSegmentName.values():
+                segmentation.RemoveSegment(segmentID)
+
+        slicer.mrmlScene.RemoveNode(colorTableNode)
+
+        # Set terminology and color for remaining segments
+        for labelValue in labelValueToSegmentName:
+            segmentName = labelValueToSegmentName[labelValue]
+            segmentId = segmentName
+            self.setTerminology(outputSegmentation, segmentName, segmentId)
+        
+        return True
+
+    def setTerminology(self, segmentation, segmentName, segmentId):
+        segment = segmentation.GetSegmentation().GetSegment(segmentId)  # check whether file contains segmentId
+        if not segment:
+            # Segment is not present in this segmentation
+            return
+        if segmentName in self.bravecowcowLabelTerminology:
+            terminologyEntryStr = self.bravecowcowLabelTerminology[segmentName]['terminologyStr']
+            segment.SetTag(segment.GetTerminologyEntryTagName(), terminologyEntryStr)
+            try:
+                label, color = self.getSegmentLabelColor(terminologyEntryStr)
+                if self.useStandardSegmentNames:
+                    segment.SetName(label)
+                segment.SetColor(color)
+            except RuntimeError as e:
+                self.log(str(e))
+
+#
+# BraveCowCowTest
+#
+class BraveCowCowTest(ScriptedLoadableModuleTest):
+    """
+    Test cases for BraveCowCow module.
+    """
+    def setUp(self):
+        """ 
+        Reset the state - clear scene and initialize test data.
+        """
+        slicer.mrmlScene.Clear()
+        self.delayDisplay("Setting up test") 
+        self.logic = BraveCowCowLogic()
+        self.widget = slicer.modules.bravecowcow.widgetRepresentation()
+        
+        import SampleData
+        self.inputVolume = SampleData.downloadSample('CTChest')
+        self.outputSegmentation = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode')
+
+    def runTest(self):
+        """
+        Run test suite.
+        """
+        self.delayDisplay("Starting tests")
+        
+        self.setUp()
+        self.test_Logic()
+        
+        self.setUp()
+        self.test_TerminologyLoading()
+        
+        self.setUp()
+        self.test_SegmentationProcessing()
+        
+        self.setUp()
+        self.test_SubsetProcessing()
+        
+        self.setUp()
+        self.test_ErrorHandling()
+        
+        self.setUp()
+        self.test_FileOperations()
+
+    def test_Logic(self):
+        """
+        Test basic logic functionality.
+        """
+        self.delayDisplay("Starting logic test")
+
+        try:
+            # test parameterNode init
+            parameterNode = self.logic.getParameterNode()
+            self.assertIsNotNone(parameterNode)
+
+            # test input arg setting
+            defaultParameters = {
+                "CPU": "false",
+                "UseStandardSegmentNames": "true",
+                "Task": "551",  # by default
+                "TargetMode": "subset"
+            }            
+            self.assertIn("551", self.logic.tasks)
+            self.assertEqual(self.logic.tasks["551"]["title"], "Core organs")            
+            for parameter, defaultValue in defaultParameters.items():
+                self.assertEqual(
+                    parameterNode.GetParameter(parameter) or "",
+                    defaultValue,
+                    f"Parameter {parameter} default value incorrect"
+                )
+
+            # test task completeness
+            self.assertIsNotNone(self.logic.tasks)
+            self.assertTrue(len(self.logic.tasks) > 0)            
+            for taskId, taskInfo in self.logic.tasks.items():
+                if taskId != 'all':
+                    self.assertTrue(taskId.isdigit())
+                    self.assertIn('title', taskInfo)
+                    self.assertIsInstance(taskInfo['title'], str)
+            self.delayDisplay('Logic test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"Logic test failed with error: {str(e)}")
+
+    def test_TerminologyLoading(self):
+        """
+        Test terminology loading and mapping.
+        """
+        self.delayDisplay("Starting terminology loading test")
+
+        try:
+            # test terminology loading
+            self.assertIsNotNone(self.logic.bravecowcowLabelTerminology)
+            
+            # test mapping
+            testCases = [
+                ("spleen", "78961009"),
+                ("kidney_right", "64033007"),
+                ("kidney_left", "64033007"),
+            ]
+            for structure, expected_code in testCases:
+                self.assertIn(structure, self.logic.bravecowcowLabelTerminology)
+                term_info = self.logic.bravecowcowLabelTerminology[structure]
+                self.assertIn("terminologyStr", term_info)
+                self.assertIn("slicerLabel", term_info)
+            self.delayDisplay('Terminology loading test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"Terminology loading test failed with error: {str(e)}")
+
+    def test_SegmentationProcessing(self):
+        """
+        Test segmentation algorithm processing pipeline.
+        """
+        import tempfile
+        import shutil
+        self.delayDisplay("Starting segmentation processing test")
+
+        try:
+            tempFolder = tempfile.mkdtemp()
+            inputFile = os.path.join(tempFolder, "test_input.nii.gz")
+            outputFolder = os.path.join(tempFolder, "test_output")
+            os.makedirs(outputFolder, exist_ok=True)
+
+            # write downloaded sample to input file
+            volumeStorageNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            volumeStorageNode.SetFileName(inputFile)
+            volumeStorageNode.UseCompressionOff()
+            volumeStorageNode.WriteData(self.inputVolume)
+            volumeStorageNode.UnRegister(None)
+
+            # test provessVolume()
+            result = self.logic.processVolume(
+                inputFile=inputFile,
+                inputVolume=self.inputVolume,
+                outputSegmentationFolder=outputFolder,
+                outputSegmentation=self.outputSegmentation,
+                task="551",
+                subset=None,
+                cpu=True,
+                bravecowcowCommand=["echo", "test"]
+            )
+            
+            shutil.rmtree(tempFolder)
+            
+            self.delayDisplay('Segmentation processing test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"Segmentation processing test failed with error: {str(e)}")
+
+    def test_SubsetProcessing(self):
+        """
+        Test processing with subset of organs.
+        """
+        import shutil
+
+        self.delayDisplay("Starting subset processing test")
+
+        try:
+            subset = ["lung_upper_lobe_left", "lung_lower_lobe_right", "trachea"]
+            
+            # test subset is valid
+            self.assertTrue(all(organ in self.logic.bravecowcowLabelTerminology for organ in subset))
+
+            # test subset handling
+            tempFolder = slicer.util.tempDirectory()
+            inputFile = os.path.join(tempFolder, "test_input.nii.gz")
+            outputFolder = os.path.join(tempFolder, "test_output")
+            os.makedirs(outputFolder, exist_ok=True)
+
+            # write downloaded sample to input file
+            volumeStorageNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            volumeStorageNode.SetFileName(inputFile)
+            volumeStorageNode.UseCompressionOff()
+            volumeStorageNode.WriteData(self.inputVolume)
+            volumeStorageNode.UnRegister(None)
+
+            result = self.logic.processVolume(
+                inputFile=inputFile,
+                inputVolume=self.inputVolume,
+                outputSegmentationFolder=outputFolder,
+                outputSegmentation=self.outputSegmentation,
+                task="551",
+                subset=subset,
+                cpu=True,
+                bravecowcowCommand=["echo", "test"]
+            )
+
+            shutil.rmtree(tempFolder)
+            
+            self.delayDisplay('Subset processing test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"Subset processing test failed with error: {str(e)}")
+
+    def test_ErrorHandling(self):
+        """
+        Test error handling scenarios.
+        """
+        self.delayDisplay("Starting error handling test")
+
+        try:
+            with self.assertRaises(ValueError):
+                self.logic.process(None, self.outputSegmentation)
+
+            invalid_tasks = [
+                "invalid_task",  # not digit
+                "999",          # non-existing task id
+                "-1",          # negative
+                "0"            # invalid id
+            ]
+            
+            for invalid_task in invalid_tasks:
+                try:
+                    self.logic.process(
+                        self.inputVolume,
+                        self.outputSegmentation,
+                        task=invalid_task
+                    )
+                    self.fail(f"Expected ValueError for invalid task: {invalid_task}")
+                except ValueError as e:
+                    self.assertIn("Invalid task", str(e))
+
+            # test invalid subset
+            invalid_subset = ["nonexistent_organ"]
+            try:
+                self.logic.process(
+                    self.inputVolume,
+                    self.outputSegmentation,
+                    task="551",
+                    subset=invalid_subset
+                )
+                self.fail("Expected ValueError for invalid subset")
+            except ValueError as e:
+                expected_messages = [
+                    "Invalid organs in subset",
+                    "Cannot validate subset for task"
+                ]
+                self.assertTrue(
+                    any(msg in str(e) for msg in expected_messages),
+                    f"Error message '{str(e)}' does not match any expected message"
+                )
+
+            self.delayDisplay('Error handling test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"Error handling test failed with error: {str(e)}")
+
+    def test_FileOperations(self):
+        """
+        Test file reading and writing operations.
+        """
+        import shutil
+        import os
+        self.delayDisplay("Starting file operations test")
+
+        try:
+            tempFolder = slicer.util.tempDirectory()
+            
+            # test writing an input file
+            inputFile = os.path.join(tempFolder, "test_input.nii.gz")
+            volumeStorageNode = slicer.mrmlScene.CreateNodeByClass("vtkMRMLVolumeArchetypeStorageNode")
+            volumeStorageNode.SetFileName(inputFile)
+            self.assertTrue(volumeStorageNode.WriteData(self.inputVolume))
+            
+            # test reading a segmentation file
+            outputFolder = os.path.join(tempFolder, "test_output")
+            os.makedirs(outputFolder, exist_ok=True)
+            
+            # cleanup
+            volumeStorageNode.UnRegister(None)
+            shutil.rmtree(tempFolder)
+
+            self.delayDisplay('File operations test passed')
+            
+        except Exception as e:
+            self.delayDisplay(f'Test failed: {str(e)}', msec=1000)
+            self.fail(f"File operations test failed with error: {str(e)}")
