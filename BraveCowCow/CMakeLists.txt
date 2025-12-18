@@ -7,7 +7,6 @@ set(MODULE_PYTHON_SCRIPTS
   )
 
 set(MODULE_PYTHON_RESOURCES
-  Resources/SegmentationCategoryTypeModifier-BRAVECOWCOW.term.json
   Resources/Icons/${MODULE_NAME}.png
   Resources/UI/${MODULE_NAME}.ui
   Resources/bravecowcow_snomed_mapping.csv
