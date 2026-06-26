@@ -6,12 +6,12 @@ This repository provides the 3D Slicer extension for **BraveCowCow**, enabling f
 
 **BraveCowCow** implements a fast 2D tri-axial ROI extraction combined with 3D multi-task segmentation and classification for intracranial vessel analysis. 
 
-🎉 This algorithm achieved **2nd place** in the **RSNA 2024 Intracranial Aneurysm Detection Challenge**.
+🎉 This algorithm achieved **2nd place** in the **RSNA 2025 Intracranial Aneurysm Detection Challenge**.
 
 👉 This repository focuses on the 3D Slicer plugin, providing an easy-to-use interface for clinical and research workflows in vascular imaging.
 
 ## Useful Links
-- [🏆 RSNA 2024 Challenge Solution Write-up](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection/writeups/2nd-place-solution)
+- [🏆 RSNA 2025 Challenge Solution Write-up](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection/writeups/2nd-place-solution)
 - [🔧 BraveCowCow Code Repository](https://github.com/huanghoujing/bravecowcow_inference_docker)
 - [📠 Inference Demo](https://www.kaggle.com/code/pengchengshi/bravecowcow-2nd-place-inference-demo)
 - [🛠 BraveCowCow 3D Slicer Plugin](https://github.com/murong-xu/SlicerBraveCowCow)
@@ -21,7 +21,12 @@ This repository provides the 3D Slicer extension for **BraveCowCow**, enabling f
 If you use this software and find this work useful, please cite:
 
 ```bibtex
-TODO
+@article{shi2026intracranialaneurysmclassificationsegmentation,
+  title={Intracranial Aneurysm Classification and Segmentation via Tri-Axial ROI and Multi-Task Learning},
+  author={Pengcheng Shi and Kaiyuan Yang and Houjing Huang and Jiawei Chen and Yan Lu and Jiaqi Liu and Murong Xu and Bjoern Menze and Xinglin Zhang},
+  journal={arXiv preprint arXiv:2606.26706},
+  year={2026}
+}
 ```
 
 ## Installation
@@ -59,9 +64,9 @@ TODO
 
 ## Quick Start
 1. **Open the BraveCowCow extension** in 3D Slicer.  
-2. **Load your CTA (CT Angiography) image file (Dicom or nifti).**  
+2. **Load your image file**, including CTA, MRA, T1 post-contrast, or T2-weighted MRI (DICOM or NIfTI).  
 3. **Set the input parameters:**  
-   - **Input volume**: The CTA image you want to analyze.  
+   - **Input volume**: The image you want to analyze.  
    - **Run classification only**: 
      - `No` (default): Perform both segmentation and classification.
      - `Yes`: Only perform classification (faster, returns probability scores only).
@@ -80,7 +85,7 @@ TODO
      - **BraveCowCow Python package**:  
        - `Force install dependencies`: Re-installs the BraveCowCow package.  
        - `Get package information`: Shows the current BraveCowCow package version.
-4. **Run**: Click `Apply`, and BraveCowCow will begin analyzing your CTA scan.  
+4. **Run**: Click `Apply`, and BraveCowCow will begin analyzing the input image.  
 5. **View the results:**  
    - **Classification**: Aneurysm probability scores are displayed in a pop-up table window.
    - **Segmentation**: Up to 3 segmentation files may be generated depending on your settings:
@@ -144,11 +149,18 @@ This work is affiliated with the MICCAI [TopCoW](https://topcow24.grand-challeng
 
 ## License and Citation
 
-- **Codebase** (the `bravecowcow` package and all source code in this repository) is licensed under TODO. 
-- **Model weights** will be released under TODO.
+- **Codebase** (the `bravecowcow` package and all source code in this repository) is licensed under the Apache License 2.0.
+- **Model weights** are released for research use only and are licensed under CC BY-NC 4.0.
 
 If you use BraveCowCow in your research, please cite:
+
 ```bibtex
-TODO
+@article{shi2026intracranialaneurysmclassificationsegmentation,
+  title={Intracranial Aneurysm Classification and Segmentation via Tri-Axial ROI and Multi-Task Learning},
+  author={Pengcheng Shi and Kaiyuan Yang and Houjing Huang and Jiawei Chen and Yan Lu and Jiaqi Liu and Murong Xu and Bjoern Menze and Xinglin Zhang},
+  journal={arXiv preprint arXiv:2606.26706},
+  year={2026}
+}
 ```
+
 ## Troubleshooting
