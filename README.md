@@ -150,7 +150,7 @@ This work is affiliated with the MICCAI [TopCoW](https://topcow24.grand-challeng
 ## License and Citation
 
 - **Codebase** (the `bravecowcow` package and all source code in this repository) is licensed under the Apache License 2.0.
-- **Model weights** are released for research use only and are licensed under CC BY-NC 4.0.
+- **Model weights** are licensed under the Apache License 2.0.
 
 If you use BraveCowCow in your research, please cite:
 
